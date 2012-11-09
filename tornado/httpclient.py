@@ -34,13 +34,21 @@ from __future__ import absolute_import, division, with_statement
 import calendar
 import email.utils
 import httplib
+import re
 import time
+import urlparse
 import weakref
 
-from tornado.escape import utf8
+from tornado.escape import utf8, _unicode
 from tornado import httputil
 from tornado.ioloop import IOLoop
 from tornado.util import import_object, bytes_type, Configurable
+
+
+try:
+    import ssl  # python 2.6+
+except ImportError:
+    ssl = None
 
 
 class HTTPClient(object):
@@ -291,6 +299,35 @@ class HTTPRequest(object):
         self.client_key = client_key
         self.client_cert = client_cert
         self.start_time = time.time()
+        self._parse_url(self.url)
+
+
+    def _parse_url(self, url):
+        self.parsed = urlparse.urlsplit(_unicode(self.url))
+        if ssl is None and self.parsed.scheme == "https":
+            raise ValueError("HTTPS requires either python2.6+ or "
+                             "curl_httpclient")
+        if self.parsed.scheme not in ("http", "https"):
+            raise ValueError("Unsupported url scheme: %s" %
+                             self.url)
+
+        # urlsplit results have hostname and port results, but they
+        # didn't support ipv6 literals until python 2.7.
+        self.netloc = self.parsed.netloc
+        if "@" in self.netloc:
+            self.userpass, _, self.netloc = self.netloc.rpartition("@")
+        match = re.match(r'^(.+):(\d+)$', self.netloc)
+        if match:
+            self.host = match.group(1)
+            self.port = int(match.group(2))
+        else:
+            self.host = self.netloc
+            self.port = 443 if self.parsed.scheme == "https" else 80
+        if re.match(r'^\[.*\]$', self.host):
+            # raw ipv6 addresses in urls are enclosed in brackets
+            self.host = self.host[1:-1]
+        self.parsed_hostname = self.host  # save final host for _on_connect
+
 
 
 class HTTPResponse(object):

@@ -91,6 +91,57 @@ class SimpleAsyncHTTPClient(AsyncHTTPClient):
         self.max_buffer_size = max_buffer_size
         self.resolver = resolver or Resolver(io_loop=io_loop)
 
+        # Removeme, dev marker
+        self._stream_pool = {}
+
+        # SSl and http
+        # pool {
+        # index: (scheme, host, port)
+        # value : {stream:current_actives}
+        # }
+
+
+    def _on_stream_close(self, request):
+        """
+        Called when a stream is detected as closed by tornado.
+        """
+        #don't forget to completely delete the queue entry if we go to 0 remaining
+        # queue item
+        # Autoclean!
+
+        #if isinstance(connection.stream, SSLIOStream):
+            #self.https_socket_pool.remove(stream)
+       # else:
+            #self.https_socket_pool.remove(stream)
+
+
+    def _get_connected_streams(self, request):
+        """
+        Returns the connection pool for a given request based on
+        (host, port) target
+        """
+        pool_id = (request.host, request.port)
+        pool = self._stream_pool.get(pool_id)
+        if not pool:
+            pool = collections.deque()
+            self._stream_pool[pool_id] = pool
+        return pool
+
+
+    def _get_stream(self, request):
+        """
+        Returns a connected free stream if one is available or a new one if not.
+        """
+        connected_pool = self._get_connected_streams(request)
+        if len(connected_pool) < 1:
+            stream = None
+            # Connect a new socket
+        else:
+            stream = connected_pool.popleft()
+
+        return stream
+
+
     def fetch(self, request, callback, **kwargs):
         if not isinstance(request, HTTPRequest):
             request = HTTPRequest(url=request, **kwargs)
@@ -106,16 +157,26 @@ class SimpleAsyncHTTPClient(AsyncHTTPClient):
                           "%d active, %d queued requests." % (
                     len(self.active), len(self.queue)))
 
+
     def _process_queue(self):
         with stack_context.NullContext():
-            while self.queue and len(self.active) < self.max_clients:
+            while self.queue:
                 request, callback = self.queue.popleft()
+
+                # if all connections are full, re-push the request to the queue
+                # and wait for other completions
+                pool_id = (request.host, request.port)
+                if len(self._get_connected_streams(pool_id)) >= self.max_clients:
+                    self.queue.append((request, callback))
+                    continue
+
                 key = object()
                 self.active[key] = (request, callback)
                 _HTTPConnection(self.io_loop, self, request,
                                 functools.partial(self._release_fetch, key),
                                 callback,
                                 self.max_buffer_size)
+
 
     def _release_fetch(self, key):
         del self.active[key]
@@ -140,48 +201,29 @@ class _HTTPConnection(object):
         self._decompressor = None
         # Timeout handle returned by IOLoop.add_timeout
         self._timeout = None
+
+        if self.client.hostname_mapping is not None:
+            self.request.host = \
+                self.client.hostname_mapping.get(self.request.host,
+                    self.request.host)
+
+        if request.allow_ipv6:
+            af = socket.AF_UNSPEC
+        else:
+            # We only try the first IP we get from getaddrinfo,
+            # so restrict to ipv4 by default.
+            af = socket.AF_INET
+
         with stack_context.StackContext(self.cleanup):
-            self.parsed = urlparse.urlsplit(_unicode(self.request.url))
-            if ssl is None and self.parsed.scheme == "https":
-                raise ValueError("HTTPS requires either python2.6+ or "
-                                 "curl_httpclient")
-            if self.parsed.scheme not in ("http", "https"):
-                raise ValueError("Unsupported url scheme: %s" %
-                                 self.request.url)
-            # urlsplit results have hostname and port results, but they
-            # didn't support ipv6 literals until python 2.7.
-            netloc = self.parsed.netloc
-            if "@" in netloc:
-                userpass, _, netloc = netloc.rpartition("@")
-            match = re.match(r'^(.+):(\d+)$', netloc)
-            if match:
-                host = match.group(1)
-                port = int(match.group(2))
-            else:
-                host = netloc
-                port = 443 if self.parsed.scheme == "https" else 80
-            if re.match(r'^\[.*\]$', host):
-                # raw ipv6 addresses in urls are enclosed in brackets
-                host = host[1:-1]
-            self.parsed_hostname = host  # save final host for _on_connect
-            if self.client.hostname_mapping is not None:
-                host = self.client.hostname_mapping.get(host, host)
-
-            if request.allow_ipv6:
-                af = socket.AF_UNSPEC
-            else:
-                # We only try the first IP we get from getaddrinfo,
-                # so restrict to ipv4 by default.
-                af = socket.AF_INET
-
             self.client.resolver.getaddrinfo(
-                host, port, af, socket.SOCK_STREAM, 0, 0,
-                callback=self._on_resolve)
+                self.request.host, self.request.port, af, socket.SOCK_STREAM,
+                0, 0, callback=self._on_resolve)
+
 
     def _on_resolve(self, future):
         af, socktype, proto, canonname, sockaddr = future.result()[0]
 
-        if self.parsed.scheme == "https":
+        if self.request.parsed.scheme == "https":
             ssl_options = {}
             if self.request.validate_cert:
                 ssl_options["cert_reqs"] = ssl.CERT_REQUIRED
@@ -213,6 +255,7 @@ class _HTTPConnection(object):
                 # information.
                 ssl_options["ssl_version"] = ssl.PROTOCOL_SSLv3
 
+            # TODO: get connected streams
             self.stream = SSLIOStream(socket.socket(af, socktype, proto),
                                       io_loop=self.io_loop,
                                       ssl_options=ssl_options,
@@ -249,7 +292,7 @@ class _HTTPConnection(object):
                            # self.parsed.hostname) until 2.7, here is
                            # correctly parsed value calculated in
                            # __init__
-                           self.parsed_hostname)
+                           self.request.parsed_hostname)
         if (self.request.method not in self._SUPPORTED_METHODS and
             not self.request.allow_nonstandard_methods):
             raise KeyError("unknown method %s" % self.request.method)
@@ -261,13 +304,14 @@ class _HTTPConnection(object):
         if "Connection" not in self.request.headers:
             self.request.headers["Connection"] = "close"
         if "Host" not in self.request.headers:
-            if '@' in self.parsed.netloc:
-                self.request.headers["Host"] = self.parsed.netloc.rpartition('@')[-1]
+            if '@' in self.request.parsed.netloc:
+                self.request.headers["Host"] = self.request.parsed.netloc.rpartition('@')[-1]
             else:
-                self.request.headers["Host"] = self.parsed.netloc
+                self.request.headers["Host"] = self.request.parsed.netloc
         username, password = None, None
-        if self.parsed.username is not None:
-            username, password = self.parsed.username, self.parsed.password
+        if self.request.parsed.username is not None:
+            username, password = self.request.parsed.username, \
+                                 self.request.parsed.password
         elif self.request.auth_username is not None:
             username = self.request.auth_username
             password = self.request.auth_password or ''
@@ -290,8 +334,8 @@ class _HTTPConnection(object):
             self.request.headers["Content-Type"] = "application/x-www-form-urlencoded"
         if self.request.use_gzip:
             self.request.headers["Accept-Encoding"] = "gzip"
-        req_path = ((self.parsed.path or '/') +
-                (('?' + self.parsed.query) if self.parsed.query else ''))
+        req_path = ((self.request.parsed.path or '/') +
+                (('?' + self.request.parsed.query) if self.request.parsed.query else ''))
         request_lines = [utf8("%s %s HTTP/1.1" % (self.request.method,
                                                   req_path))]
         for k, v in self.request.headers.get_all():
