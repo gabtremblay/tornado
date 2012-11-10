@@ -101,45 +101,109 @@ class SimpleAsyncHTTPClient(AsyncHTTPClient):
         # }
 
 
-    def _on_stream_close(self, request):
+    def _build_ssl_options(self, request):
+        ssl_options = {}
+        if request.validate_cert:
+            ssl_options["cert_reqs"] = ssl.CERT_REQUIRED
+        if request.ca_certs is not None:
+            ssl_options["ca_certs"] = request.ca_certs
+        else:
+            ssl_options["ca_certs"] = _DEFAULT_CA_CERTS
+        if request.client_key is not None:
+            ssl_options["keyfile"] = request.client_key
+        if request.client_cert is not None:
+            ssl_options["certfile"] = request.client_cert
+
+        # SSL interoperability is tricky.  We want to disable
+        # SSLv2 for security reasons; it wasn't disabled by default
+        # until openssl 1.0.  The best way to do this is to use
+        # the SSL_OP_NO_SSLv2, but that wasn't exposed to python
+        # until 3.2.  Python 2.7 adds the ciphers argument, which
+        # can also be used to disable SSLv2.  As a last resort
+        # on python 2.6, we set ssl_version to SSLv3.  This is
+        # more narrow than we'd like since it also breaks
+        # compatibility with servers configured for TLSv1 only,
+        # but nearly all servers support SSLv3:
+        # http://blog.ivanristic.com/2011/09/ssl-survey-protocol-support.html
+        if sys.version_info >= (2, 7):
+            ssl_options["ciphers"] = "DEFAULT:!SSLv2"
+        else:
+            # This is really only necessary for pre-1.0 versions
+            # of openssl, but python 2.6 doesn't expose version
+            # information.
+            ssl_options["ssl_version"] = ssl.PROTOCOL_SSLv3
+
+        return ssl_options
+
+
+    def _can_process_request(self, request):
         """
-        Called when a stream is detected as closed by tornado.
+        Test if there's a free stream or if we can spawn a new one
         """
-        #don't forget to completely delete the queue entry if we go to 0 remaining
-        # queue item
-        # Autoclean!
+        stream_pool, active_connections = self._get_stream_pool(request)
+        if len(stream_pool) > 0:
+            return True
+        elif active_connections < self.max_clients:
+            return True
+        else:
+            return False
 
-        #if isinstance(connection.stream, SSLIOStream):
-            #self.https_socket_pool.remove(stream)
-       # else:
-            #self.https_socket_pool.remove(stream)
 
-
-    def _get_connected_streams(self, request):
+    def _get_stream_pool(self, request):
         """
         Returns the connection pool for a given request based on
         (host, port) target
         """
         pool_id = (request.host, request.port)
-        pool = self._stream_pool.get(pool_id)
-        if not pool:
+        pool_value = self._stream_pool.get(pool_id)
+
+        if not pool_value:
             pool = collections.deque()
-            self._stream_pool[pool_id] = pool
-        return pool
+            active_connections = 0
+            self._stream_pool[pool_id] = (pool, active_connections)
+        else:
+            pool, active_connections = pool_value
+
+        return pool, active_connections
 
 
-    def _get_stream(self, request):
+    def get_stream(self, request, af, socktype, proto):
         """
         Returns a connected free stream if one is available or a new one if not.
         """
-        connected_pool = self._get_connected_streams(request)
-        if len(connected_pool) < 1:
-            stream = None
-            # Connect a new socket
-        else:
-            stream = connected_pool.popleft()
+        pool_id = (request.host, request.port)
+        stream_pool, active_connections = self._get_stream_pool(request)
+        if len(stream_pool) > 0:
+            free_stream = stream_pool.popleft()
+        elif active_connections < self.max_clients:
+            # Connect a new stream
+            # if connect fail, server does not accept more connections, let just re-queue this request.
+            try:
+                if request.parsed.scheme == "https":
+                    ssl_options = self._build_ssl_options(request)
+                    free_stream = SSLIOStream(socket.socket(af, socktype, proto),
+                                    io_loop=self.io_loop,
+                                    ssl_options=ssl_options,
+                                    max_buffer_size=self.max_buffer_size)
 
-        return stream
+                else:
+                    free_stream = IOStream(socket.socket(af, socktype, proto),
+                                    io_loop=self.io_loop,
+                                    max_buffer_size=self.max_buffer_size)
+
+                free_stream.set_close_callback(
+                    functools.partial(self._on_stream_close, request))
+                active_connections += 1
+                self._stream_pool[pool_id] = (stream_pool, active_connections)
+
+            except socket.timeout:
+                # Server-side Max connection reached, re-queue requestIOStream
+                free_stream = None
+        else:
+            # No connection available, max clients reached.
+            free_stream = None
+
+        return free_stream
 
 
     def fetch(self, request, callback, **kwargs):
@@ -163,24 +227,40 @@ class SimpleAsyncHTTPClient(AsyncHTTPClient):
             while self.queue:
                 request, callback = self.queue.popleft()
 
-                # if all connections are full, re-push the request to the queue
-                # and wait for other completions
-                pool_id = (request.host, request.port)
-                if len(self._get_connected_streams(pool_id)) >= self.max_clients:
+                # Test if we can process the request
+                if self._can_process_request(request):
+                    _HTTPConnection(self.io_loop, self, request,
+                        functools.partial(self._release_fetch, request),
+                        callback,
+                        self.max_buffer_size)
+                else:
+                    # No free stream available, re-queue request
                     self.queue.append((request, callback))
-                    continue
-
-                key = object()
-                self.active[key] = (request, callback)
-                _HTTPConnection(self.io_loop, self, request,
-                                functools.partial(self._release_fetch, key),
-                                callback,
-                                self.max_buffer_size)
 
 
-    def _release_fetch(self, key):
-        del self.active[key]
+    def _release_fetch(self, request):
+        pool_id = (request.host, request.port)
+        pool, active_connections = self._get_stream_pool(request)
+        active_connections -= 1
+        self._stream_pool[pool_id] = (pool, active_connections)
+        pool.append(request.stream)
         self._process_queue()
+
+
+
+    def _on_stream_close(self, request):
+        """
+        Called when a stream is detected as closed by tornado. This could mean we are done sending requests
+        for fitness purposes, if it's the last stream to be closed for a pool_id, we should delete the pool entry.
+        """
+        pool_id = (request.host, request.port)
+        pool, active_connections = self._get_stream_pool(request)
+        active_connections -= 1
+        if active_connections <= 0:
+            del self._stream_pool[pool_id] #fitness
+        else:
+            self._stream_pool[pool_id] = (pool, active_connections)
+
 
 
 class _HTTPConnection(object):
@@ -199,7 +279,7 @@ class _HTTPConnection(object):
         self.headers = None
         self.chunks = None
         self._decompressor = None
-        # Timeout handle returned by IOLoop.add_timeout
+        # Timeout handle returned by IOLoo_on_resp.add_timeout
         self._timeout = None
 
         if self.client.hostname_mapping is not None:
@@ -223,54 +303,22 @@ class _HTTPConnection(object):
     def _on_resolve(self, future):
         af, socktype, proto, canonname, sockaddr = future.result()[0]
 
-        if self.request.parsed.scheme == "https":
-            ssl_options = {}
-            if self.request.validate_cert:
-                ssl_options["cert_reqs"] = ssl.CERT_REQUIRED
-            if self.request.ca_certs is not None:
-                ssl_options["ca_certs"] = self.request.ca_certs
-            else:
-                ssl_options["ca_certs"] = _DEFAULT_CA_CERTS
-            if self.request.client_key is not None:
-                ssl_options["keyfile"] = self.request.client_key
-            if self.request.client_cert is not None:
-                ssl_options["certfile"] = self.request.client_cert
+        # Assign an iostream to the request
+        self.request.stream = self.client.get_stream(self.request, af, socktype, proto)
 
-            # SSL interoperability is tricky.  We want to disable
-            # SSLv2 for security reasons; it wasn't disabled by default
-            # until openssl 1.0.  The best way to do this is to use
-            # the SSL_OP_NO_SSLv2, but that wasn't exposed to python
-            # until 3.2.  Python 2.7 adds the ciphers argument, which
-            # can also be used to disable SSLv2.  As a last resort
-            # on python 2.6, we set ssl_version to SSLv3.  This is
-            # more narrow than we'd like since it also breaks
-            # compatibility with servers configured for TLSv1 only,
-            # but nearly all servers support SSLv3:
-            # http://blog.ivanristic.com/2011/09/ssl-survey-protocol-support.html
-            if sys.version_info >= (2, 7):
-                ssl_options["ciphers"] = "DEFAULT:!SSLv2"
-            else:
-                # This is really only necessary for pre-1.0 versions
-                # of openssl, but python 2.6 doesn't expose version
-                # information.
-                ssl_options["ssl_version"] = ssl.PROTOCOL_SSLv3
+        # Stream acquire failed, re-queue request and exit graceully.
+        if not self.request.stream:
+            self.client.queue.append((self.request, self.release_callback))
+            return
 
-            # TODO: get connected streams
-            self.stream = SSLIOStream(socket.socket(af, socktype, proto),
-                                      io_loop=self.io_loop,
-                                      ssl_options=ssl_options,
-                                      max_buffer_size=self.max_buffer_size)
-        else:
-            self.stream = IOStream(socket.socket(af, socktype, proto),
-                                   io_loop=self.io_loop,
-                                   max_buffer_size=self.max_buffer_size)
         timeout = min(self.request.connect_timeout, self.request.request_timeout)
         if timeout:
             self._timeout = self.io_loop.add_timeout(
                 self.start_time + timeout,
                 stack_context.wrap(self._on_timeout))
-        self.stream.set_close_callback(self._on_close)
-        self.stream.connect(sockaddr, self._on_connect)
+        self.request.stream.set_close_callback(self._on_close)
+        self.request.stream.connect(sockaddr, self._on_connect)
+
 
     def _on_timeout(self):
         self._timeout = None
@@ -286,8 +334,8 @@ class _HTTPConnection(object):
                 self.start_time + self.request.request_timeout,
                 stack_context.wrap(self._on_timeout))
         if (self.request.validate_cert and
-            isinstance(self.stream, SSLIOStream)):
-            match_hostname(self.stream.socket.getpeercert(),
+            isinstance(self.request.stream, SSLIOStream)):
+            match_hostname(self.request.stream.socket.getpeercert(),
                            # ipv6 addresses are broken (in
                            # self.parsed.hostname) until 2.7, here is
                            # correctly parsed value calculated in
@@ -343,10 +391,10 @@ class _HTTPConnection(object):
             if b('\n') in line:
                 raise ValueError('Newline in header: ' + repr(line))
             request_lines.append(line)
-        self.stream.write(b("\r\n").join(request_lines) + b("\r\n\r\n"))
+        self.request.stream.write(b("\r\n").join(request_lines) + b("\r\n\r\n"))
         if self.request.body is not None:
-            self.stream.write(self.request.body)
-        self.stream.read_until_regex(b("\r?\n\r?\n"), self._on_headers)
+            self.request.stream.write(self.request.body)
+        self.request.stream.read_until_regex(b("\r?\n\r?\n"), self._on_headers)
 
     def _release(self):
         if self.release_callback is not None:
@@ -376,8 +424,8 @@ class _HTTPConnection(object):
     def _on_close(self):
         if self.final_callback is not None:
             message = "Connection closed"
-            if self.stream.error:
-                message = str(self.stream.error)
+            if self.client.stream.error:
+                message = str(self.client.stream.error)
             raise HTTPError(599, message)
 
     def _on_headers(self, data):
@@ -387,7 +435,7 @@ class _HTTPConnection(object):
         assert match
         code = int(match.group(1))
         if 100 <= code < 200:
-            self.stream.read_until_regex(b("\r?\n\r?\n"), self._on_headers)
+            self.request.stream.read_until_regex(b("\r?\n\r?\n"), self._on_headers)
             return
         else:
             self.code = code
@@ -432,11 +480,11 @@ class _HTTPConnection(object):
             self._decompressor = GzipDecompressor()
         if self.headers.get("Transfer-Encoding") == "chunked":
             self.chunks = []
-            self.stream.read_until(b("\r\n"), self._on_chunk_length)
+            self.request.stream.read_until(b("\r\n"), self._on_chunk_length)
         elif content_length is not None:
-            self.stream.read_bytes(content_length, self._on_body)
+            self.request.stream.read_bytes(content_length, self._on_body)
         else:
-            self.stream.read_until_close(self._on_body)
+            self.request.stream.read_until_close(self._on_body)
 
     def _on_body(self, data):
         if self._timeout is not None:
@@ -473,7 +521,7 @@ class _HTTPConnection(object):
             self.final_callback = None
             self._release()
             self.client.fetch(new_request, final_callback)
-            self.stream.close()
+            self.request.stream.close()
             return
         if self._decompressor:
             data = (self._decompressor.decompress(data) +
@@ -493,7 +541,7 @@ class _HTTPConnection(object):
                                 buffer=buffer,
                                 effective_url=self.request.url)
         self._run_callback(response)
-        self.stream.close()
+        self.request.stream.close()
 
     def _on_chunk_length(self, data):
         # TODO: "chunk extensions" http://tools.ietf.org/html/rfc2616#section-3.6.1
@@ -516,7 +564,7 @@ class _HTTPConnection(object):
                 self._decompressor = None
             self._on_body(b('').join(self.chunks))
         else:
-            self.stream.read_bytes(length + 2,  # chunk ends with \r\n
+            self.request.stream.read_bytes(length + 2,  # chunk ends with \r\n
                               self._on_chunk_data)
 
     def _on_chunk_data(self, data):
@@ -528,7 +576,7 @@ class _HTTPConnection(object):
             self.request.streaming_callback(chunk)
         else:
             self.chunks.append(chunk)
-        self.stream.read_until(b("\r\n"), self._on_chunk_length)
+        self.request.stream.read_until(b("\r\n"), self._on_chunk_length)
 
 
 # match_hostname was added to the standard library ssl module in python 3.2.
