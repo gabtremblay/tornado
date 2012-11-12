@@ -306,6 +306,7 @@ class _HTTPConnection(object):
         # Assign an iostream to the request
         self.request.stream = self.client.get_stream(self.request, af, socktype, proto)
 
+        print self.request.stream
         # Stream acquire failed, re-queue request and exit graceully.
         if not self.request.stream:
             self.client.queue.append((self.request, self.release_callback))
@@ -419,6 +420,7 @@ class _HTTPConnection(object):
                                 request_time=self.io_loop.time() - self.start_time,
                                 ))
             if hasattr(self, "stream"):
+                #TODO: Should not close stream
                 self.stream.close()
 
     def _on_close(self):
